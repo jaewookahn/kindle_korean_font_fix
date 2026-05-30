@@ -6,13 +6,7 @@ import urllib.parse
 
 from calibre.gui2.actions import InterfaceAction
 from calibre.gui2 import info_dialog, error_dialog
-
-try:
-    from qt.core import QProgressDialog, QMenu, Qt, QApplication
-except ImportError:
-    from PyQt5.Qt import QProgressDialog, QMenu, Qt, QApplication
-
-from calibre_plugins.fetch_page_count.config import prefs, ConfigDialog
+from calibre_plugins.fetch_page_count.config import prefs
 
 REQUEST_DELAY = 0.4
 
@@ -23,10 +17,14 @@ class FetchPageCountAction(InterfaceAction):
                    '선택 도서의 페이지수를 알라딘 / Google Books에서 가져옵니다', None)
 
     def genesis(self):
+        try:
+            from qt.core import QMenu
+        except ImportError:
+            from PyQt5.Qt import QMenu
+
         self.menu = QMenu(self.gui)
         self.qaction.setMenu(self.menu)
         self.qaction.triggered.connect(self.fetch_pages)
-
         self.menu.addAction('페이지수 가져오기').triggered.connect(self.fetch_pages)
         self.menu.addSeparator()
         self.menu.addAction('설정...').triggered.connect(self.configure)
@@ -34,13 +32,56 @@ class FetchPageCountAction(InterfaceAction):
     # ── 설정 다이얼로그 ────────────────────────────────────────────────────────
 
     def configure(self):
-        d = ConfigDialog(self.gui)
-        if d.exec_() == d.Accepted:
-            d.commit()
+        try:
+            from qt.core import (QDialog, QVBoxLayout, QLabel,
+                                 QLineEdit, QDialogButtonBox)
+        except ImportError:
+            from PyQt5.Qt import (QDialog, QVBoxLayout, QLabel,
+                                  QLineEdit, QDialogButtonBox)
+
+        class _Dlg(QDialog):
+            def __init__(self, parent):
+                super().__init__(parent)
+                self.setWindowTitle('페이지수 가져오기 — 설정')
+                self.setMinimumWidth(430)
+                lay = QVBoxLayout(self)
+
+                lay.addWidget(QLabel('알라딘 TTB API 키 (없으면 스크래핑만 사용):'))
+                self.ttb = QLineEdit(prefs['ttb_key'])
+                self.ttb.setPlaceholderText('ttbXXXXXXXXXXXX')
+                lay.addWidget(self.ttb)
+
+                lay.addWidget(QLabel('컬럼 이름 (# 없이):'))
+                self.col = QLineEdit(prefs['pages_column'])
+                lay.addWidget(self.col)
+
+                note = QLabel(
+                    '<a href="https://www.aladin.co.kr/ttb/wbloglist.aspx">'
+                    'TTB 키 발급 (무료, 알라딘 로그인 필요)</a>'
+                )
+                note.setOpenExternalLinks(True)
+                lay.addWidget(note)
+
+                bb = QDialogButtonBox(
+                    QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+                )
+                bb.accepted.connect(self.accept)
+                bb.rejected.connect(self.reject)
+                lay.addWidget(bb)
+
+        d = _Dlg(self.gui)
+        if d.exec_():
+            prefs['ttb_key']      = d.ttb.text().strip()
+            prefs['pages_column'] = d.col.text().strip() or 'pages'
 
     # ── 메인 로직 ──────────────────────────────────────────────────────────────
 
     def fetch_pages(self):
+        try:
+            from qt.core import QProgressDialog, Qt, QApplication
+        except ImportError:
+            from PyQt5.Qt import QProgressDialog, Qt, QApplication
+
         book_ids = self.gui.current_view().get_selected_ids()
         if not book_ids:
             info_dialog(self.gui, '페이지수 가져오기', '책을 먼저 선택하세요.', show=True)
@@ -52,9 +93,9 @@ class FetchPageCountAction(InterfaceAction):
         if not _column_exists(db, col):
             error_dialog(
                 self.gui, '컬럼 없음',
-                f"사용자 정의 컬럼 '#{col}'이 존재하지 않습니다.\n"
-                "환경설정 > 사용자 정의 컬럼에서 먼저 추가하거나,\n"
-                "'설정...' 메뉴에서 컬럼 이름을 수정하세요.",
+                f"사용자 정의 컬럼 '#{col}'이 없습니다.\n"
+                "환경설정 > 사용자 정의 컬럼에서 추가하거나,\n"
+                "'설정...'에서 컬럼 이름을 수정하세요.",
                 show=True,
             )
             return
@@ -163,8 +204,10 @@ def _aladdin_search_scrape(title, authors):
     m    = re.search(r'wproduct\.aspx\?ItemId=(\d+)', html)
     if not m:
         return 0
-    product = _get(f'https://www.aladin.co.kr/shop/wproduct.aspx?ItemId={m.group(1)}',
-                   decode=True)
+    product = _get(
+        f'https://www.aladin.co.kr/shop/wproduct.aspx?ItemId={m.group(1)}',
+        decode=True,
+    )
     mm = _PAGE_RE.search(product)
     return int(mm.group(1)) if mm else 0
 
@@ -203,8 +246,10 @@ def _show_summary(gui, updated, not_found):
     lines = [f'업데이트: {len(updated)}권  /  미발견: {len(not_found)}권', '']
     if updated:
         lines += ['[업데이트]'] + [f'  · {t}' for t in updated[:15]]
-        if len(updated) > 15: lines.append(f'  ... 외 {len(updated)-15}권')
+        if len(updated) > 15:
+            lines.append(f'  ... 외 {len(updated) - 15}권')
     if not_found:
         lines += ['', '[찾지 못한 책]'] + [f'  · {t}' for t in not_found[:10]]
-        if len(not_found) > 10: lines.append(f'  ... 외 {len(not_found)-10}권')
+        if len(not_found) > 10:
+            lines.append(f'  ... 외 {len(not_found) - 10}권')
     info_dialog(gui, '완료', '\n'.join(lines), show=True)
