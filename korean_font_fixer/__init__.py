@@ -31,11 +31,9 @@ class KoreanFontFixer(FileTypePlugin):
             infos = zf.infolist()
             contents = {i.filename: (zf.read(i.filename), i) for i in infos}
 
-        css_names = [n for n in contents if n.lower().endswith('.css')]
-        if not css_names:
-            return None
+        modified = _strip_page_lists(contents)
 
-        modified = False
+        css_names = [n for n in contents if n.lower().endswith('.css')]
         for name in css_names:
             data, info = contents[name]
             try:
@@ -65,6 +63,56 @@ class KoreanFontFixer(FileTypePlugin):
             '예: NanumGothic, KoPub Dotum, Noto Sans KR\n'
             '(폰트 파일을 폰트 뷰어에서 열면 family name 확인 가능)'
         )
+
+
+# ── 페이지 리스트 제거 ─────────────────────────────────────────────────────────
+
+def _strip_page_lists(contents):
+    """NCX의 <pageList>와 EPUB3 nav의 <nav epub:type="page-list"> 제거.
+
+    KFX 변환 후 킨들이 EPUB 페이지 데이터를 우선해 KFX 페이지 추정을 무시하는
+    문제를 해결한다.
+    """
+    modified = False
+
+    for name in list(contents.keys()):
+        data, info = contents[name]
+        lower = name.lower()
+
+        if lower.endswith('.ncx'):
+            try:
+                text = data.decode('utf-8')
+            except UnicodeDecodeError:
+                text = data.decode('latin-1')
+
+            new_text = re.sub(
+                r'<pageList\b[^>]*>.*?</pageList\s*>',
+                '',
+                text,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            if new_text != text:
+                contents[name] = (new_text.encode('utf-8'), info)
+                modified = True
+
+        elif lower.endswith(('.xhtml', '.html', '.htm')):
+            try:
+                text = data.decode('utf-8')
+            except UnicodeDecodeError:
+                continue
+
+            # EPUB3 nav document의 page-list 섹션 제거
+            new_text = re.sub(
+                r'<nav\b[^>]*epub:type=["\']page-list["\'][^>]*>.*?</nav\s*>',
+                '',
+                text,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            if new_text != text:
+                contents[name] = (new_text.encode('utf-8'), info)
+                modified = True
+
+    return modified
 
 
 # ── CSS 처리 ───────────────────────────────────────────────────────────────────
