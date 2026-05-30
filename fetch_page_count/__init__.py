@@ -102,7 +102,9 @@ class FetchPageCountAction(InterfaceAction):
 
         from calibre.gui2 import info_dialog, error_dialog
 
-        book_ids = self.gui.current_view().get_selected_ids()
+        view = self.gui.current_view()
+        rows = view.selectionModel().selectedRows()
+        book_ids = list(map(view.model().id, rows))
         if not book_ids:
             info_dialog(self.gui, '페이지수 가져오기', '책을 먼저 선택하세요.', show=True)
             return
@@ -148,7 +150,7 @@ class FetchPageCountAction(InterfaceAction):
 
         db.commit()
         pd.setValue(len(book_ids))
-        self.gui.current_view().refresh_ids(book_ids)
+        self.gui.current_view().refresh_grid()
 
         lines = [f'업데이트: {len(updated)}권  /  미발견: {len(not_found)}권', '']
         if updated:
