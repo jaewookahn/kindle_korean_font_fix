@@ -111,14 +111,16 @@ class FetchPageCountAction(InterfaceAction):
         col = p['pages_column']
         db  = self.gui.current_db
 
-        if col not in db.field_metadata.custom_field_metadata():
+        col_key = col if col.startswith('#') else f'#{col}'
+        if col_key not in db.field_metadata.custom_field_metadata():
             error_dialog(
                 self.gui, '컬럼 없음',
-                f"사용자 정의 컬럼 '#{col}'이 없습니다.\n"
+                f"사용자 정의 컬럼 '{col_key}'이 없습니다.\n"
                 "'설정...'에서 컬럼 이름을 확인하세요.",
                 show=True)
             return
 
+        label = col.lstrip('#')
         ttb = p['ttb_key']
         pd  = QProgressDialog('준비 중...', '취소', 0, len(book_ids), self.gui)
         pd.setWindowTitle('페이지수 가져오기')
@@ -137,7 +139,7 @@ class FetchPageCountAction(InterfaceAction):
 
             pages = _get_pages(mi, ttb)
             if pages:
-                db.set_custom(book_id, pages, label=col, commit=False)
+                db.set_custom(book_id, pages, label=label, commit=False)
                 updated.append(f'{mi.title}  →  {pages}쪽')
             else:
                 not_found.append(mi.title)
