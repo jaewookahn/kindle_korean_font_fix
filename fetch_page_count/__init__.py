@@ -18,7 +18,7 @@ from calibre.gui2.actions import InterfaceAction  # noqa: E402
 
 class FetchPageCountAction(InterfaceAction):
     name        = 'Fetch Page Count'
-    action_spec = ('페이지수 가져오기', None,
+    action_spec = ('페이지수 가져오기', 'book.png',
                    '선택 도서의 페이지수를 알라딘 / Google Books에서 가져옵니다', None)
 
     def genesis(self):
@@ -87,38 +87,22 @@ class FetchPageCountAction(InterfaceAction):
         self._run_fetch()
 
     def _selected_book_ids(self):
-        """현재 library_view 에서 실제로 선택된 책의 id 목록을 반환.
-
-        calibre 내부 액션(EditMetadataAction 등)이 사용하는 패턴과 동일하게
-        selectionModel().selectedRows() → model().id(row) 로 매핑한다.
-        get_selected_ids() 가 컨텍스트에 따라 엉뚱한 id 를 돌려주는 사례가
-        있어 가장 신뢰성 있는 방식으로 통일한다.
-        """
         view = self.gui.library_view
         sm   = view.selectionModel()
         rows = sm.selectedRows() if sm is not None else []
         m    = view.model()
+
         ids  = []
         seen = set()
         for r in rows:
             try:
-                bid = m.id(r)
+                bid = m.id(r.row())
             except Exception:
                 continue
             if bid is None or bid in seen:
                 continue
             seen.add(bid)
             ids.append(bid)
-        # selectedRows 가 비어있는 경우(드물게 셀 선택 모드 등) currentIndex 로 폴백
-        if not ids:
-            try:
-                idx = view.currentIndex()
-                if idx is not None and idx.isValid():
-                    bid = m.id(idx)
-                    if bid is not None:
-                        ids.append(bid)
-            except Exception:
-                pass
         return ids
 
     def _run_fetch(self):
@@ -141,7 +125,8 @@ class FetchPageCountAction(InterfaceAction):
         db  = self.gui.current_db
 
         col_key = col if col.startswith('#') else f'#{col}'
-        if col_key not in db.field_metadata.custom_field_metadata():
+        cfm = db.field_metadata.custom_field_metadata()
+        if col_key not in cfm:
             error_dialog(
                 self.gui, '컬럼 없음',
                 f"사용자 정의 컬럼 '{col_key}'이 없습니다.\n"
@@ -149,6 +134,7 @@ class FetchPageCountAction(InterfaceAction):
                 show=True)
             return
 
+        col_dtype = cfm[col_key].get('datatype')
         label = col.lstrip('#')
         ttb = p['ttb_key']
         pd  = QProgressDialog('준비 중...', '취소', 0, len(book_ids), self.gui)
@@ -161,17 +147,19 @@ class FetchPageCountAction(InterfaceAction):
         for i, book_id in enumerate(book_ids):
             if pd.wasCanceled():
                 break
-            mi = db.get_metadata(book_id)
+            mi = db.new_api.get_metadata(book_id)
             pd.setLabelText(f'({i+1}/{len(book_ids)}) {mi.title[:55]}')
             pd.setValue(i)
             QApplication.processEvents()
 
-            pages = _get_pages(mi, ttb)
+            reasons = set()
+            pages = _get_pages(mi, ttb, reasons=reasons)
             if pages:
-                db.set_custom(book_id, pages, label=label, commit=False)
+                val = str(pages) if col_dtype == 'text' else pages
+                db.set_custom(book_id, val, label=label, commit=False)
                 updated.append(f'{mi.title}  →  {pages}쪽')
             else:
-                not_found.append(mi.title)
+                not_found.append((mi.title, ', '.join(sorted(reasons))))
 
             time.sleep(0.4)
 
@@ -185,7 +173,11 @@ class FetchPageCountAction(InterfaceAction):
             if len(updated) > 15:
                 lines.append(f'  ... 외 {len(updated)-15}권')
         if not_found:
-            lines += ['', '[미발견]'] + [f'  · {t}' for t in not_found[:10]]
+            lines += ['', '[미발견]']
+            for t, why in not_found[:15]:
+                lines.append(f'  · {t}  —  {why}')
+            if len(not_found) > 15:
+                lines.append(f'  ... 외 {len(not_found)-15}권')
         info_dialog(self.gui, '완료', '\n'.join(lines), show=True)
 
 
@@ -200,12 +192,11 @@ def _has_hangul(s):
     return False
 
 
-def _get_pages(mi, ttb=''):
-    """페이지수 조회.
+_SESSION = {'google_quota_dead': False}
 
-    한글 제목 → 알라딘 우선, 영어/기타 제목 → Google Books 우선.
-    어느 쪽이 실패하더라도 ISBN/제목으로 가능한 모든 fallback 을 시도한다.
-    """
+
+def _get_pages(mi, ttb='', reasons=None):
+    """페이지수 조회. reasons set 에 실패 사유 코드를 추가."""
     import re
     isbn    = re.sub(r'[^0-9X]', '', (mi.isbn or '').upper())
     title   = (mi.title or '').strip()
@@ -215,32 +206,40 @@ def _get_pages(mi, ttb=''):
 
     aladin_steps = []
     if ttb:
-        if isbn:  aladin_steps.append(lambda: _al_api_isbn(isbn, ttb))
-        if title: aladin_steps.append(lambda: _al_api_title(title, authors, ttb))
-    if isbn:  aladin_steps.append(lambda: _al_scrape(isbn))
-    if title: aladin_steps.append(lambda: _al_search(title, authors))
+        if isbn:  aladin_steps.append(('aladin', lambda: _al_api_isbn(isbn, ttb)))
+        if title: aladin_steps.append(('aladin', lambda: _al_api_title(title, authors, ttb)))
+    if isbn:  aladin_steps.append(('aladin', lambda: _al_scrape(isbn)))
+    if title: aladin_steps.append(('aladin', lambda: _al_search(title, authors)))
 
     google_steps = []
     if isbn:
-        google_steps.append(lambda: _google(f'isbn:{isbn}'))
+        google_steps.append(('google', lambda: _google(f'isbn:{isbn}')))
     if title:
         q = f'intitle:"{title}"' + (f'+inauthor:"{authors[0]}"' if authors else '')
-        google_steps.append(lambda: _google(q))
-        # 따옴표 없는 느슨한 검색도 한 번 더 시도
+        google_steps.append(('google', lambda: _google(q)))
         q2 = f'intitle:{title}' + (f'+inauthor:{authors[0]}' if authors else '')
         if q2 != q:
-            google_steps.append(lambda: _google(q2))
+            google_steps.append(('google', lambda: _google(q2)))
 
-    # 한글이면 알라딘 먼저, 영어면 Google Books 먼저
     steps = (aladin_steps + google_steps) if korean else (google_steps + aladin_steps)
 
-    for fn in steps:
+    for src, fn in steps:
+        if src == 'google' and _SESSION['google_quota_dead']:
+            if reasons is not None: reasons.add('Google 쿼터 초과')
+            continue
         try:
             p = fn()
             if p and 10 < p < 10000:
                 return p
-        except Exception:
-            pass
+        except Exception as e:
+            msg = str(e)
+            if src == 'google' and '429' in msg:
+                _SESSION['google_quota_dead'] = True
+                if reasons is not None: reasons.add('Google 쿼터 초과')
+            elif reasons is not None:
+                reasons.add(f'{src}: {type(e).__name__}')
+    if reasons is not None and not reasons:
+        reasons.add('알라딘/Google 모두 결과 없음' if (ttb or isbn or title) else 'ISBN/제목 없음')
     return 0
 
 
@@ -253,24 +252,49 @@ def _http(url, decode=False):
     return raw.decode('utf-8', errors='replace') if decode else raw
 
 
-def _al_api_isbn(isbn, key):
+def _al_lookup(query, item_id_type, key):
+    """ItemLookUp 호출. eBook 이면 paperBookList 의 종이책으로 재시도."""
     import json
     url = (f'https://www.aladin.co.kr/ttb/api/ItemLookUp.aspx'
-           f'?ttbkey={key}&itemIdType=ISBN13&ItemId={isbn}'
+           f'?ttbkey={key}&itemIdType={item_id_type}&ItemId={query}'
            f'&output=js&Version=20131101&OptResult=subInfo')
-    d = json.loads(_http(url))
-    return int((d.get('item') or [{}])[0].get('subInfo', {}).get('itemPage') or 0)
+    d = json.loads(_http(url, decode=True))
+    item = (d.get('item') or [{}])[0]
+    sub  = item.get('subInfo') or {}
+    page = int(sub.get('itemPage') or 0)
+    if page:
+        return page
+    # eBook → 종이책으로 재시도 (같은 query 면 스킵)
+    paper = (sub.get('paperBookList') or [{}])[0]
+    paper_isbn = paper.get('isbn13') or paper.get('isbn')
+    paper_id   = paper.get('itemId')
+    if paper_isbn and str(paper_isbn) != str(query):
+        return _al_lookup(paper_isbn, 'ISBN13', key)
+    if paper_id and str(paper_id) != str(query):
+        return _al_lookup(paper_id, 'ItemId', key)
+    return 0
+
+
+def _al_api_isbn(isbn, key):
+    return _al_lookup(isbn, 'ISBN13', key)
 
 
 def _al_api_title(title, authors, key):
+    """ItemSearch 로 ItemId 찾고 ItemLookUp 으로 페이지수 조회."""
     import json, urllib.parse
     q = title + (' ' + authors[0] if authors else '')
     url = (f'https://www.aladin.co.kr/ttb/api/ItemSearch.aspx'
            f'?ttbkey={key}&Query={urllib.parse.quote(q)}'
-           f'&QueryType=Title&MaxResults=1&SearchTarget=Book'
-           f'&output=js&Version=20131101&OptResult=subInfo')
-    d = json.loads(_http(url))
-    return int((d.get('item') or [{}])[0].get('subInfo', {}).get('itemPage') or 0)
+           f'&QueryType=Title&MaxResults=3&SearchTarget=Book'
+           f'&output=js&Version=20131101')
+    d = json.loads(_http(url, decode=True))
+    for it in (d.get('item') or []):
+        iid = it.get('itemId')
+        if iid:
+            p = _al_lookup(iid, 'ItemId', key)
+            if p:
+                return p
+    return 0
 
 
 def _al_scrape(isbn):
