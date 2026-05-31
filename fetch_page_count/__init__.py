@@ -6,7 +6,7 @@ class FetchPageCountPlugin(InterfaceActionBase):
     description             = '선택 도서의 페이지수를 알라딘 / Google Books에서 가져와 pages 컬럼에 저장'
     supported_platforms     = ['windows', 'osx', 'linux']
     author                  = 'Custom'
-    version                 = (1, 2, 0)
+    version                 = (1, 3, 0)
     minimum_calibre_version = (5, 0, 0)
     actual_plugin           = 'calibre_plugins.fetch_page_count:FetchPageCountAction'
 
@@ -70,15 +70,10 @@ class FetchPageCountAction(InterfaceAction):
     # ── 메인 ──────────────────────────────────────────────────────────────────
 
     def fetch_pages(self):
-        import re, json, time
-        import urllib.request, urllib.parse
-
         try:
-            from qt.core import QProgressDialog, QMenu, Qt, QApplication
+            from qt.core import QMenu
         except ImportError:
-            from PyQt5.Qt import QProgressDialog, QMenu, Qt, QApplication
-
-        from calibre.gui2 import info_dialog, error_dialog
+            from PyQt5.Qt import QMenu
 
         # 첫 실행 시 메뉴로 전환 (설정 항목 추가)
         if not hasattr(self, '_menu_built'):
@@ -91,9 +86,43 @@ class FetchPageCountAction(InterfaceAction):
 
         self._run_fetch()
 
+    def _selected_book_ids(self):
+        """현재 library_view 에서 실제로 선택된 책의 id 목록을 반환.
+
+        calibre 내부 액션(EditMetadataAction 등)이 사용하는 패턴과 동일하게
+        selectionModel().selectedRows() → model().id(row) 로 매핑한다.
+        get_selected_ids() 가 컨텍스트에 따라 엉뚱한 id 를 돌려주는 사례가
+        있어 가장 신뢰성 있는 방식으로 통일한다.
+        """
+        view = self.gui.library_view
+        sm   = view.selectionModel()
+        rows = sm.selectedRows() if sm is not None else []
+        m    = view.model()
+        ids  = []
+        seen = set()
+        for r in rows:
+            try:
+                bid = m.id(r)
+            except Exception:
+                continue
+            if bid is None or bid in seen:
+                continue
+            seen.add(bid)
+            ids.append(bid)
+        # selectedRows 가 비어있는 경우(드물게 셀 선택 모드 등) currentIndex 로 폴백
+        if not ids:
+            try:
+                idx = view.currentIndex()
+                if idx is not None and idx.isValid():
+                    bid = m.id(idx)
+                    if bid is not None:
+                        ids.append(bid)
+            except Exception:
+                pass
+        return ids
+
     def _run_fetch(self):
-        import re, json, time
-        import urllib.request, urllib.parse
+        import time
 
         try:
             from qt.core import QProgressDialog, Qt, QApplication
@@ -102,7 +131,7 @@ class FetchPageCountAction(InterfaceAction):
 
         from calibre.gui2 import info_dialog, error_dialog
 
-        book_ids = self.gui.library_view.get_selected_ids()
+        book_ids = self._selected_book_ids()
         if not book_ids:
             info_dialog(self.gui, '페이지수 가져오기', '책을 먼저 선택하세요.', show=True)
             return
@@ -162,22 +191,48 @@ class FetchPageCountAction(InterfaceAction):
 
 # ── 페이지수 조회 ─────────────────────────────────────────────────────────────
 
+def _has_hangul(s):
+    if not s:
+        return False
+    for ch in s:
+        if '가' <= ch <= '힣' or 'ᄀ' <= ch <= 'ᇿ' or '㄰' <= ch <= '㆏':
+            return True
+    return False
+
+
 def _get_pages(mi, ttb=''):
+    """페이지수 조회.
+
+    한글 제목 → 알라딘 우선, 영어/기타 제목 → Google Books 우선.
+    어느 쪽이 실패하더라도 ISBN/제목으로 가능한 모든 fallback 을 시도한다.
+    """
     import re
-    isbn    = re.sub(r'[^0-9X]', '', mi.isbn or '')
+    isbn    = re.sub(r'[^0-9X]', '', (mi.isbn or '').upper())
     title   = (mi.title or '').strip()
     authors = mi.authors or []
 
-    steps = []
+    korean = _has_hangul(title) or any(_has_hangul(a) for a in authors)
+
+    aladin_steps = []
     if ttb:
-        if isbn:  steps.append(lambda: _al_api_isbn(isbn, ttb))
-        if title: steps.append(lambda: _al_api_title(title, authors, ttb))
-    if isbn:  steps.append(lambda: _al_scrape(isbn))
-    if title: steps.append(lambda: _al_search(title, authors))
-    if isbn:  steps.append(lambda: _google(f'isbn:{isbn}'))
+        if isbn:  aladin_steps.append(lambda: _al_api_isbn(isbn, ttb))
+        if title: aladin_steps.append(lambda: _al_api_title(title, authors, ttb))
+    if isbn:  aladin_steps.append(lambda: _al_scrape(isbn))
+    if title: aladin_steps.append(lambda: _al_search(title, authors))
+
+    google_steps = []
+    if isbn:
+        google_steps.append(lambda: _google(f'isbn:{isbn}'))
     if title:
-        q = f'intitle:{title}' + (f'+inauthor:{authors[0]}' if authors else '')
-        steps.append(lambda: _google(q))
+        q = f'intitle:"{title}"' + (f'+inauthor:"{authors[0]}"' if authors else '')
+        google_steps.append(lambda: _google(q))
+        # 따옴표 없는 느슨한 검색도 한 번 더 시도
+        q2 = f'intitle:{title}' + (f'+inauthor:{authors[0]}' if authors else '')
+        if q2 != q:
+            google_steps.append(lambda: _google(q2))
+
+    # 한글이면 알라딘 먼저, 영어면 Google Books 먼저
+    steps = (aladin_steps + google_steps) if korean else (google_steps + aladin_steps)
 
     for fn in steps:
         try:
@@ -242,9 +297,18 @@ def _al_search(title, authors):
 
 
 def _google(q):
+    """Google Books 에서 페이지수를 찾는다.
+
+    첫 결과에 pageCount 가 없는 경우가 많아 상위 몇 건을 훑어 페이지수가
+    있는 첫 결과를 반환한다.
+    """
     import json, urllib.parse
     url  = ('https://www.googleapis.com/books/v1/volumes'
-            f'?q={urllib.parse.quote(q)}&maxResults=1&fields=items/volumeInfo/pageCount')
+            f'?q={urllib.parse.quote(q)}&maxResults=5'
+            '&fields=items/volumeInfo/pageCount,items/volumeInfo/title')
     d     = json.loads(_http(url))
-    items = d.get('items') or []
-    return int(items[0].get('volumeInfo', {}).get('pageCount') or 0) if items else 0
+    for item in (d.get('items') or []):
+        n = int(item.get('volumeInfo', {}).get('pageCount') or 0)
+        if n:
+            return n
+    return 0
